@@ -26,59 +26,84 @@ import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.TimeoutException;
 
 class KafkaCallback implements Callback {
+	static class ProducerContext {
+		// standard references we pass to all callbacks from the publisher
+		public Counter producedMessageCount;
+		public Counter failedMessageCount;
+		public Meter producedMessageMeter;
+		public Meter failedMessageMeter;
+		public MaxwellKafkaProducerWorker producer;
+		public String fallbackTopic;
+		public MaxwellContext maxwell;
+
+		public ProducerContext(MaxwellKafkaProducerWorker producer,
+		                       MaxwellContext maxwell,
+		                       String fallbackTopic,
+		                       Counter producedMessageCount, Counter failedMessageCount,
+		                       Meter producedMessageMeter, Meter failedMessageMeter
+		) {
+			this.producedMessageCount = producedMessageCount;
+			this.failedMessageCount = failedMessageCount;
+			this.producedMessageMeter = producedMessageMeter;
+			this.failedMessageMeter = failedMessageMeter;
+			this.producer = producer;
+			this.fallbackTopic = fallbackTopic;
+			this.maxwell = maxwell;
+		}
+
+		public ProducerContext withoutFallbackTopic() {
+			return new ProducerContext(producer, maxwell, null,
+				producedMessageCount, failedMessageCount, producedMessageMeter, failedMessageMeter);
+		}
+	}
+
 	public static final Logger LOGGER = LoggerFactory.getLogger(MaxwellKafkaProducer.class);
 	private final AbstractAsyncProducer.CallbackCompleter cc;
 	private final Position position;
 	private final String json;
 	private final RowIdentity key;
-	private final String fallbackTopic;
-	private final MaxwellKafkaProducerWorker producer;
-	private final MaxwellContext context;
+	private final ProducerContext context;
 
-	private Counter succeededMessageCount;
-	private Counter failedMessageCount;
-	private Meter succeededMessageMeter;
-	private Meter failedMessageMeter;
-
-	public KafkaCallback(AbstractAsyncProducer.CallbackCompleter cc, Position position, RowIdentity key, String json,
-	                     Counter producedMessageCount, Counter failedMessageCount, Meter producedMessageMeter,
-	                     Meter failedMessageMeter, String fallbackTopic, MaxwellContext context,
-	                     MaxwellKafkaProducerWorker producer) {
+	public KafkaCallback(AbstractAsyncProducer.CallbackCompleter cc, Position position,
+	                     RowIdentity key, String json, ProducerContext context) {
 		this.cc = cc;
 		this.position = position;
 		this.key = key;
 		this.json = json;
-		this.succeededMessageCount = producedMessageCount;
-		this.failedMessageCount = failedMessageCount;
-		this.succeededMessageMeter = producedMessageMeter;
-		this.failedMessageMeter = failedMessageMeter;
-		this.fallbackTopic = fallbackTopic;
-		this.producer = producer;
 		this.context = context;
+	}
+
+	private KafkaCallback withContext(ProducerContext context) {
+		return new KafkaCallback(cc, position, key, json, context);
+	}
+
+	ProducerContext getContext() {
+		return context;
 	}
 
 	@Override
 	public void onCompletion(RecordMetadata md, Exception e) {
 		if ( e != null ) {
-			this.failedMessageCount.inc();
-			this.failedMessageMeter.mark();
+			context.failedMessageCount.inc();
+			context.failedMessageMeter.mark();
 
 			LOGGER.error(e.getClass().getSimpleName() + " @ " + position + " -- " + key);
 			LOGGER.error(e.getLocalizedMessage());
 
-			boolean nonFatal = e instanceof RecordTooLargeException || context.getConfig().ignoreProducerError;
+			boolean nonFatal = e instanceof RecordTooLargeException || context.maxwell.getConfig().ignoreProducerError;
+
 			if (nonFatal) {
-				if (this.fallbackTopic == null) {
+				if (context.fallbackTopic == null) {
 					cc.markCompleted();
 				} else {
 					publishFallback(md, e);
 				}
 			} else {
-				context.terminate(e);
+				context.maxwell.terminate(e);
 			}
 		} else {
-			this.succeededMessageCount.inc();
-			this.succeededMessageMeter.mark();
+			context.producedMessageCount.inc();
+			context.producedMessageMeter.mark();
 
 			if (LOGGER.isDebugEnabled()) {
 				LOGGER.debug("->  key:" + key + ", partition:" + md.partition() + ", offset:" + md.offset());
@@ -93,11 +118,10 @@ class KafkaCallback implements Callback {
 	private void publishFallback(RecordMetadata md, Exception e) {
 		// When publishing a fallback record, make a callback
 		// with no fallback topic to avoid infinite loops
-		KafkaCallback cb = new KafkaCallback(cc, position, key, json,
-			succeededMessageCount, failedMessageCount, succeededMessageMeter,
-			failedMessageMeter, null, context, producer);
+		ProducerContext fallbackContext = context.withoutFallbackTopic();
+		KafkaCallback cb = this.withContext(fallbackContext);
 		try {
-			producer.sendFallbackAsync(fallbackTopic, key, cb, e);
+			context.producer.sendFallbackAsync(context.fallbackTopic, key, cb, e);
 		} catch (Exception fallbackEx) {
 			cb.onCompletion(md, fallbackEx);
 		}
@@ -148,6 +172,8 @@ class MaxwellKafkaProducerWorker extends AbstractAsyncProducer implements Runnab
 	private Thread thread;
 	private StoppableTaskState taskState;
 
+	private final KafkaCallback.ProducerContext producerContext;
+
 	public static MaxwellKafkaPartitioner makeDDLPartitioner(String partitionHashFunc, String partitionKey) {
 		if ( partitionKey.equals("table") ) {
 			return new MaxwellKafkaPartitioner(partitionHashFunc, "table", null, "database");
@@ -181,6 +207,9 @@ class MaxwellKafkaProducerWorker extends AbstractAsyncProducer implements Runnab
 			keyFormat = KeyFormat.HASH;
 		else
 			keyFormat = KeyFormat.ARRAY;
+
+		this.producerContext = new KafkaCallback.ProducerContext(this, context, context.getConfig().deadLetterTopic,
+				succeededMessageCount, failedMessageCount, succeededMessageMeter, failedMessageMeter);
 
 		this.queue = queue;
 		this.taskState = new StoppableTaskState("MaxwellKafkaProducerWorker");
@@ -228,9 +257,7 @@ class MaxwellKafkaProducerWorker extends AbstractAsyncProducer implements Runnab
 		/* if debug logging isn't enabled, release the reference to `value`, which can ease memory pressure somewhat */
 		String value = KafkaCallback.LOGGER.isDebugEnabled() ? record.value() : null;
 
-		KafkaCallback callback = new KafkaCallback(cc, r.getNextPosition(), r.getRowIdentity(), value,
-				this.succeededMessageCount, this.failedMessageCount, this.succeededMessageMeter, this.failedMessageMeter,
-				this.context.getConfig().deadLetterTopic, this.context, this);
+		KafkaCallback callback = new KafkaCallback(cc, r.getNextPosition(), r.getRowIdentity(), value, this.producerContext);
 
 		sendAsync(record, callback);
 	}
